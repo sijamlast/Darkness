@@ -1,0 +1,2549 @@
+/*
+============================================================
+ DARKNESS DYNAMIC LIGHTING
+============================================================
+
+ ScriptCards call:
+
+ --@darknessdl|[&NewTID] [&Radius] [&Shape] [&SpellName] [&EyesOn] [*S:t-id]
+original base API DL Darkness by David M, modified by @Si
+============================================================
+ FEATURES
+============================================================
+
+ • Creates a one-way UDL Darkness boundary.
+
+ • Recreates the boundary whenever Darkness moves.
+
+ • Creates four personal vision tokens outside Darkness and
+   four personal vision tokens inside it for each qualifying
+   Devil's Sight / Truesight character.
+
+ • When EyesOn = 1, also creates those eight personal vision
+   tokens explicitly for the caster source token.
+
+ • Maximum personal sight range = 120 ft.
+
+ • Detects Devil's Sight and Truesight from the
+   2014 repeating_traits section.
+
+ • Darkness token is controlled ONLY by the caster.
+
+ • The old shared invisible internal token is removed when
+   this API registers the Darkness instance.
+
+ • All eight personal vision tokens are controlled ONLY by:
+       - their associated qualifying character
+
+ • Therefore an ordinary caster can move Darkness, but gets
+   personal vision through it only when EyesOn = 1.
+
+ • Ordinary tokens entering Darkness have only
+   has_bright_light_vision turned off.
+
+ • Their night-vision settings are NEVER changed.
+
+ • Original bright-light vision is restored when they leave.
+
+ • Everything is cleaned up when Darkness is destroyed.
+============================================================
+*/
+
+var DarknessDL = DarknessDL || (function () {
+
+    'use strict';
+	
+	// ========================================================
+// USER SETTINGS — LIGHT SUPPRESSION
+// ========================================================
+
+// Tokens with this status marker are exempt from Darkness
+// light suppression and retain their bright-light vision.
+const LIGHT_EXCEPTION_MARKER = "pink";
+
+// Suppress both types of emitted light for ordinary tokens.
+const SUPPRESS_BRIGHT_LIGHT = true;
+const SUPPRESS_LOW_LIGHT = true;
+
+
+    // ========================================================
+    // SETTINGS
+    // ========================================================
+
+    const MAX_SIGHT = 120;
+
+    const VISION_ANGLE = 360;
+
+    const SIDE_ANGLE = 90;
+
+    const EDGE_OFFSET_PIXELS = 10;
+
+    /* Set to 1 for normal invisible source tokens.
+     * Set to 35 temporarily if you want to see the sources. */
+    const VISION_TOKEN_SIZE = 1;
+
+
+    // ========================================================
+    // ACTIVE DARKNESS INSTANCES
+    // ========================================================
+
+    const spells = {};
+
+
+    /*
+     * Stores the original bright-light vision state of
+     * ordinary tokens affected by Darkness.
+     *
+     * key:
+     *
+     * DarknessID:TokenID
+     */
+    const brightVisionState = {};
+
+    /*
+     * Original light settings are stored once per token, not once
+     * per Darkness instance, so overlapping areas restore correctly.
+     */
+    const lightSuppressionState = {};
+
+    const LIGHT_PROPERTIES = [
+        "emits_bright_light",
+        "bright_light_distance",
+        "emits_low_light",
+        "low_light_distance"
+    ];
+
+    function hasLightExceptionMarker(token) {
+        const markers = String(token.get("statusmarkers") || "")
+            .split(",");
+        return markers.some(function (marker) {
+            return marker.split("@")[0] === LIGHT_EXCEPTION_MARKER;
+        });
+    }
+
+    function isInsideAnyDarkness(token) {
+        return Object.keys(spells).some(function (darknessID) {
+            const data = spells[darknessID];
+            if (!data || data.pageID !== token.get("_pageid")) {
+                return false;
+            }
+            const darkness = getObj("graphic", darknessID);
+            return darkness &&
+                distanceInFeet(token, darkness) <= data.radius;
+        });
+    }
+
+    function updateLightSuppression(token) {
+        if (!token || isDarknessHelperToken(token)) {
+            return;
+        }
+
+        const inside = isInsideAnyDarkness(token);
+        const exempt = hasLightExceptionMarker(token);
+        const shouldSuppress = inside && !exempt;
+
+        if (shouldSuppress) {
+            if (!lightSuppressionState[token.id]) {
+                lightSuppressionState[token.id] = {};
+                LIGHT_PROPERTIES.forEach(function (property) {
+                    lightSuppressionState[token.id][property] = token.get(property);
+                });
+            }
+
+            if (SUPPRESS_BRIGHT_LIGHT) {
+                token.set("emits_bright_light", false);
+                token.set("bright_light_distance", 0);
+            }
+            if (SUPPRESS_LOW_LIGHT) {
+                token.set("emits_low_light", false);
+                token.set("low_light_distance", 0);
+            }
+            return;
+        }
+
+        /*
+         * Restore the original values when outside all Darkness areas,
+         * or immediately when the exception marker is present.
+         */
+        if (lightSuppressionState[token.id]) {
+            LIGHT_PROPERTIES.forEach(function (property) {
+                token.set(property, lightSuppressionState[token.id][property]);
+            });
+            delete lightSuppressionState[token.id];
+        }
+    }
+
+
+    // ========================================================
+    // PAGE SCALE
+    // ========================================================
+
+    function pixelsPerFoot(pageID) {
+
+        const page =
+            getObj(
+                "page",
+                pageID
+            );
+
+        if (!page) {
+            return 14;
+        }
+
+
+        const snapping =
+            parseFloat(
+                page.get("snapping_increment")
+            ) || 1;
+
+
+        const scale =
+            parseFloat(
+                page.get("scale_number")
+            ) || 5;
+
+
+        return (
+            70 *
+            snapping
+        ) / scale;
+    }
+
+
+    // ========================================================
+    // DARKNESS HELPER TOKEN
+    // ========================================================
+
+    function isDarknessHelperToken(token) {
+
+        if (!token) {
+            return true;
+        }
+
+
+        const name =
+            token.get("name") || "";
+
+
+        return (
+            name.indexOf("_Invis_") !== -1 ||
+            name.indexOf("Darkness_DS_") === 0
+        );
+    }
+
+
+    // ========================================================
+    // DEVIL'S SIGHT / TRUESIGHT
+    //
+    // 2014 sheet:
+    //
+    // repeating_traits_<row>_name
+    // repeating_traits_<row>_description
+    // ========================================================
+
+    function hasDarknessVisionAbility(token) {
+
+        const characterID =
+            token.get("represents");
+
+        if (!characterID) {
+            return false;
+        }
+
+        const attributes =
+            findObjs({
+                _type:
+                    "attribute",
+                _characterid:
+                    characterID
+            });
+
+        for (
+            let i = 0;
+            i < attributes.length;
+            i++
+        ) {
+
+            const name =
+                attributes[i].get("name") || "";
+
+            const match =
+                name.match(
+                    /^repeating_traits_([^_]+)_name$/
+                );
+
+            if (!match) {
+                continue;
+            }
+
+            let traitName =
+                String(
+                    attributes[i].get("current") || ""
+                )
+                .trim()
+                .toLowerCase();
+
+            /* Normalise curly apostrophes so both forms match. */
+            traitName =
+                traitName.replace(/[’‘]/g, "'");
+
+            /*
+             * Partial, case-insensitive matching is deliberate.
+             * For example:
+             *
+             * Eldritch Invocation: Devil's Sight
+             *
+             * qualifies because it contains "devil's sight".
+             */
+            if (
+                traitName.indexOf("devil's sight") !== -1 ||
+                traitName.indexOf("devils sight") !== -1 ||
+                traitName.indexOf("truesight") !== -1 ||
+                traitName.indexOf("true sight") !== -1
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+
+    // ========================================================
+    // CHARACTER TOKEN
+    // ========================================================
+
+    function isCharacterToken(token) {
+
+        if (!token) {
+            return false;
+        }
+
+
+        if (
+            isDarknessHelperToken(token)
+        ) {
+            return false;
+        }
+
+
+        const represents =
+            token.get("represents");
+
+
+        if (!represents) {
+            return false;
+        }
+
+
+        /*
+         * Exclude NPCs.
+         */
+        const npc =
+            getAttrByName(
+                represents,
+                "npc"
+            );
+
+
+        if (
+            String(npc) === "1"
+        ) {
+            return false;
+        }
+
+
+        return true;
+    }
+
+
+    // ========================================================
+    // TOKENS WHOSE BRIGHT VISION SHOULD BE MANAGED
+    // ========================================================
+
+    function shouldManageBrightVision(token) {
+
+        if (!token || isDarknessHelperToken(token)) {
+            return false;
+        }
+
+        // Normal player-character tokens retain the existing behaviour.
+        if (isCharacterToken(token)) {
+            return true;
+        }
+
+        // NPCs are only managed when their represented character is
+        // explicitly controlled by a player (including "all").
+        const characterID = token.get("represents");
+        if (!characterID) {
+            return false;
+        }
+
+        const character = getObj("character", characterID);
+        if (!character) {
+            return false;
+        }
+
+        const npc = getAttrByName(characterID, "npc");
+        if (String(npc) !== "1") {
+            return false;
+        }
+
+        const controlledBy = String(character.get("controlledby") || "").trim();
+        if (!controlledBy) {
+            return false;
+        }
+
+        // Roll20 uses "all" for all-player control.
+        if (controlledBy.split(",").map(id => id.trim()).includes("all")) {
+            return true;
+        }
+
+        // A GM-only controlled NPC should retain its normal vision behaviour.
+        return controlledBy.split(",").map(id => id.trim()).some(id => {
+            const player = getObj("player", id);
+            return player && !playerIsGM(id);
+        });
+    }
+
+
+    // ========================================================
+    // DISTANCE BETWEEN TWO TOKENS
+    // ========================================================
+
+    function distanceInFeet(
+        token1,
+        token2
+    ) {
+
+        if (
+            !token1 ||
+            !token2
+        ) {
+            return Infinity;
+        }
+
+
+        const dx =
+            token1.get("left") -
+            token2.get("left");
+
+
+        const dy =
+            token1.get("top") -
+            token2.get("top");
+
+
+        const distancePixels =
+            Math.sqrt(
+                (dx * dx) +
+                (dy * dy)
+            );
+
+
+        return (
+            distancePixels /
+            pixelsPerFoot(
+                token1.get("_pageid")
+            )
+        );
+    }
+
+
+    // ========================================================
+    // TOKENS ON PAGE
+    // ========================================================
+
+    function getPageTokens(pageID) {
+
+        return findObjs({
+            _type:
+                "graphic",
+
+            _pageid:
+                pageID
+        });
+    }
+
+
+    // ========================================================
+    // QUALIFYING TOKENS
+    // ========================================================
+
+    function getQualifyingTokens(pageID) {
+
+        return getPageTokens(
+            pageID
+        ).filter(
+            function (token) {
+
+                if (
+                    !isCharacterToken(token)
+                ) {
+                    return false;
+                }
+
+
+                return hasDarknessVisionAbility(
+                    token
+                );
+            }
+        );
+    }
+
+
+    // ========================================================
+    // CHARACTER CONTROLLERS
+    // ========================================================
+
+    function getCharacterControllers(
+        characterID
+    ) {
+
+        const character =
+            getObj(
+                "character",
+                characterID
+            );
+
+
+        if (!character) {
+            return [];
+        }
+
+
+        const controlledby =
+            character.get(
+                "controlledby"
+            );
+
+
+        if (!controlledby) {
+            return [];
+        }
+
+
+        return controlledby
+            .split(",")
+            .filter(Boolean);
+    }
+
+
+    // ========================================================
+    // UNIQUE CONTROLLERS
+    // ========================================================
+
+    function uniqueControllers(
+        ids
+    ) {
+
+        const result = [];
+
+
+        ids.forEach(
+            function (id) {
+
+                if (
+                    id &&
+                    result.indexOf(id) === -1
+                ) {
+
+                    result.push(id);
+                }
+            }
+        );
+
+
+        return result;
+    }
+
+
+    // ========================================================
+// VISION TOKEN CONTROL
+//
+// Qualifying casters control ALL personal vision tokens created
+// for their Darkness.
+//
+// Other qualifying characters having Devil's Sight or Truesight
+// also control those tokens.  EyesOn only applies to Shadow Magic Sorcerers that are also the caster
+//
+// Therefore:
+//
+//   Qualifying Caster:
+//       controls all five vision sources.
+//
+//   Qualifying character:
+//       controls their own five vision sources giving unique vision range.
+//
+//   Non qualifying characters:
+//       do not control them, darkness is impermeable.
+// ========================================================
+
+function getVisionControllers(
+    pcToken
+) {
+
+    if (!pcToken) {
+        return [];
+    }
+
+    const characterID =
+        pcToken.get(
+            "represents"
+        );
+
+    if (!characterID) {
+        return [];
+    }
+
+    return uniqueControllers(
+        getCharacterControllers(
+            characterID
+        )
+    );
+}
+
+    // ========================================================
+    // CREATE CIRCLE PATH
+    // ========================================================
+
+    function createCirclePath(
+        darkness,
+        radiusPixels
+    ) {
+
+        const segments = 32;
+
+        const points = [];
+
+
+        for (
+            let i = 0;
+            i < segments;
+            i++
+        ) {
+
+            const angle =
+                (
+                    Math.PI *
+                    2 *
+                    i
+                ) /
+                segments;
+
+
+            points.push([
+                radiusPixels +
+                radiusPixels *
+                Math.sin(angle),
+
+                radiusPixels -
+                radiusPixels *
+                Math.cos(angle)
+            ]);
+        }
+
+
+        const path = [];
+
+
+        path.push([
+            "M",
+            points[0][0],
+            points[0][1]
+        ]);
+
+
+        for (
+            let i = 1;
+            i < points.length;
+            i++
+        ) {
+
+            path.push([
+                "L",
+                points[i][0],
+                points[i][1]
+            ]);
+        }
+
+
+        path.push([
+            "L",
+            points[0][0],
+            points[0][1]
+        ]);
+
+
+        return createObj(
+            "path",
+            {
+                _pageid:
+                    darkness.get(
+                        "_pageid"
+                    ),
+
+                layer:
+                    "walls",
+
+                left:
+                    darkness.get(
+                        "left"
+                    ),
+
+                top:
+                    darkness.get(
+                        "top"
+                    ),
+
+                width:
+                    radiusPixels * 2,
+
+                height:
+                    radiusPixels * 2,
+
+                path:
+                    JSON.stringify(
+                        path
+                    ),
+
+                stroke:
+                    "#000000",
+
+                stroke_width:
+                    5,
+
+                fill:
+                    "transparent",
+
+                barrierType:
+                    "oneWay",
+
+                oneWayReversed:
+                    false
+            }
+        );
+    }
+
+
+    // ========================================================
+    // REMOVE PATH
+    // ========================================================
+
+    function removePath(
+        data
+    ) {
+
+        if (!data.pathID) {
+            return;
+        }
+
+
+        const path =
+            getObj(
+                "path",
+                data.pathID
+            );
+
+
+        if (path) {
+            path.remove();
+        }
+
+
+        data.pathID =
+            null;
+    }
+
+
+    // ========================================================
+    // CREATE / RECREATE DARKNESS PATH
+    // ========================================================
+
+    function createDarknessPath(
+        data
+    ) {
+
+        const darkness =
+            getObj(
+                "graphic",
+                data.tokenID
+            );
+
+
+        if (!darkness) {
+            return;
+        }
+
+
+        removePath(
+            data
+        );
+
+
+        const ppft =
+            pixelsPerFoot(
+                data.pageID
+            );
+
+
+        const radiusPixels =
+            data.radius *
+            ppft;
+
+
+        const path =
+            createCirclePath(
+                darkness,
+                radiusPixels
+            );
+
+
+        if (path) {
+            data.pathID =
+                path.id;
+        }
+    }
+
+
+    // ========================================================
+    // ANGLE
+    //
+    // Roll20 convention:
+    //
+    // 0   = up
+    // 90  = right
+    // 180 = down
+    // 270 = left
+    // ========================================================
+
+    function directionAngle(
+        fromToken,
+        toX,
+        toY
+    ) {
+
+        const dx =
+            toX -
+            fromToken.get(
+                "left"
+            );
+
+
+        const dy =
+            toY -
+            fromToken.get(
+                "top"
+            );
+
+
+        let angle =
+            Math.atan2(
+                dx,
+                -dy
+            ) *
+            180 /
+            Math.PI;
+
+
+        if (angle < 0) {
+            angle += 360;
+        }
+
+
+        return angle;
+    }
+
+
+    function normaliseAngle(
+        angle
+    ) {
+
+        while (angle < 0) {
+            angle += 360;
+        }
+
+
+        while (angle >= 360) {
+            angle -= 360;
+        }
+
+
+        return angle;
+    }
+
+
+// ========================================================
+// CREATE PERSONAL VISION TOKEN
+// ========================================================
+
+function createVisionToken(
+    data,
+    pcToken,
+    suffix,
+    x,
+    y,
+    angle,
+    sightRange
+) {
+
+if (sightRange <= 0) {
+    return null;
+}
+    const controllers =
+        getVisionControllers(
+            pcToken
+        );
+
+
+    const tokenName =
+        "Darkness_DS_" +
+        data.tokenID +
+        "_" +
+        pcToken.id +
+        "_" +
+        suffix;
+
+
+    return createObj(
+        "graphic",
+        {
+
+            _pageid:
+                data.pageID,
+
+            layer:
+                "objects",
+
+            name:
+                tokenName,
+
+            left:
+                x,
+
+            top:
+                y,
+
+            width:
+                VISION_TOKEN_SIZE,
+
+            height:
+                VISION_TOKEN_SIZE,
+
+            imgsrc:
+                pcToken.get(
+                    "imgsrc"
+                ),
+
+            represents:
+                "",
+
+            controlledby:
+                controllers.join(","),
+
+            showname:
+                false,
+
+            /*
+             * These are actual vision sources.
+             * Bright-light vision must remain enabled.
+             */
+            has_bright_light_vision:
+                true,
+
+            has_night_vision:
+                true,
+
+            night_vision_distance:
+                sightRange,
+
+            night_vision_tint:
+                "transparent",
+
+            night_vision_effect:
+                "Nocturnal",
+
+            has_limit_field_of_vision:
+                true,
+
+            limit_field_of_vision_center:
+                normaliseAngle(
+                    angle
+                ),
+
+            limit_field_of_vision_total:
+                VISION_ANGLE,
+
+            has_limit_field_of_night_vision:
+                true,
+
+            limit_field_of_night_vision_center:
+                normaliseAngle(
+                    angle
+                ),
+
+            limit_field_of_night_vision_total:
+                VISION_ANGLE
+        }
+    );
+}
+
+
+    // ========================================================
+    // REMOVE PERSONAL VISION TOKENS
+    // ========================================================
+
+    function removePersonalTokens(
+        darknessID
+    ) {
+
+        findObjs({
+            _type:
+                "graphic"
+        }).forEach(
+            function (token) {
+
+                const name =
+                    token.get(
+                        "name"
+                    ) || "";
+
+
+                const prefix =
+                    "Darkness_DS_" +
+                    darknessID +
+                    "_";
+
+
+                if (
+                    name.indexOf(
+                        prefix
+                    ) === 0
+                ) {
+
+                    token.remove();
+                }
+            }
+        );
+    }
+
+
+// ========================================================
+// CREATE PERSONAL VISION TOKENS
+// ========================================================
+
+function createPersonalTokens(
+    data,
+    pcToken
+) {
+
+    const darkness =
+        getObj(
+            "graphic",
+            data.tokenID
+        );
+
+
+    if (
+        !darkness ||
+        !pcToken
+    ) {
+        return;
+    }
+
+
+    const pageID =
+        data.pageID;
+
+
+    const ppft =
+        pixelsPerFoot(
+            pageID
+        );
+
+
+    const pcX =
+        pcToken.get(
+            "left"
+        );
+
+
+    const pcY =
+        pcToken.get(
+            "top"
+        );
+
+
+    const darkX =
+        darkness.get(
+            "left"
+        );
+
+
+    const darkY =
+        darkness.get(
+            "top"
+        );
+
+
+    const dx =
+        darkX -
+        pcX;
+
+
+    const dy =
+        darkY -
+        pcY;
+
+
+    const distancePixels =
+        Math.sqrt(
+            dx * dx +
+            dy * dy
+        );
+
+
+    const centreAngle =
+        directionAngle(
+            pcToken,
+            darkX,
+            darkY
+        );
+
+
+    const radiusPixels =
+        data.radius *
+        ppft;
+
+
+    const edgeDistance =
+        radiusPixels +
+        EDGE_OFFSET_PIXELS;
+
+
+    /*
+     * Unit vector from PC to Darkness.
+     */
+    const ux =
+        distancePixels === 0 ?
+        0 :
+        dx / distancePixels;
+
+
+    const uy =
+        distancePixels === 0 ?
+        -1 :
+        dy / distancePixels;
+
+
+    /*
+     * ----------------------------------------------------
+     * NEAR SOURCE
+     *
+     * Placed just outside the caster-facing edge.
+     * ----------------------------------------------------
+     */
+
+    const nearX =
+        darkX -
+        ux *
+        edgeDistance;
+
+
+    const nearY =
+        darkY -
+        uy *
+        edgeDistance;
+
+
+    /*
+     * ----------------------------------------------------
+     * FAR SOURCE
+     *
+     * Placed just outside the opposite edge.
+     * ----------------------------------------------------
+     */
+
+    const farX =
+        darkX +
+        ux *
+        edgeDistance;
+
+
+    const farY =
+        darkY +
+        uy *
+        edgeDistance;
+
+
+    /*
+     * ----------------------------------------------------
+     * SIDE DIRECTIONS
+     * ----------------------------------------------------
+     */
+
+    const angleLeft =
+        normaliseAngle(
+            centreAngle -
+            SIDE_ANGLE
+        );
+
+
+    const angleRight =
+        normaliseAngle(
+            centreAngle +
+            SIDE_ANGLE
+        );
+
+
+    const leftRadians =
+        angleLeft *
+        Math.PI /
+        180;
+
+
+    const rightRadians =
+        angleRight *
+        Math.PI /
+        180;
+
+
+    const leftUX =
+        Math.sin(
+            leftRadians
+        );
+
+
+    const leftUY =
+        -Math.cos(
+            leftRadians
+        );
+
+
+    const rightUX =
+        Math.sin(
+            rightRadians
+        );
+
+
+    const rightUY =
+        -Math.cos(
+            rightRadians
+        );
+
+
+    /*
+     * ----------------------------------------------------
+     * SIDE SOURCE POSITIONS
+     *
+     * IMPORTANT:
+     * These use +, not -.
+     *
+     * This places them on the far side of Darkness,
+     * matching the older working version.
+     * ----------------------------------------------------
+     */
+
+    const leftX =
+        darkX +
+        leftUX *
+        edgeDistance;
+
+
+    const leftY =
+        darkY +
+        leftUY *
+        edgeDistance;
+
+
+    const rightX =
+        darkX +
+        rightUX *
+        edgeDistance;
+
+
+    const rightY =
+        darkY +
+        rightUY *
+        edgeDistance;
+
+
+    /*
+     * ----------------------------------------------------
+     * DISTANCE FROM THE PC TO EACH VISION SOURCE
+     *
+     * These distances are deliberately calculated from
+     * the PC position, not from the Darkness centre.
+     * ----------------------------------------------------
+     */
+
+    const nearDistance =
+        Math.sqrt(
+            Math.pow(
+                nearX - pcX,
+                2
+            ) +
+            Math.pow(
+                nearY - pcY,
+                2
+            )
+        ) /
+        ppft;
+
+
+    const leftDistance =
+        Math.sqrt(
+            Math.pow(
+                leftX - pcX,
+                2
+            ) +
+            Math.pow(
+                leftY - pcY,
+                2
+            )
+        ) /
+        ppft;
+
+
+    const rightDistance =
+        Math.sqrt(
+            Math.pow(
+                rightX - pcX,
+                2
+            ) +
+            Math.pow(
+                rightY - pcY,
+                2
+            )
+        ) /
+        ppft;
+
+
+    const farDistance =
+        Math.sqrt(
+            Math.pow(
+                farX - pcX,
+                2
+            ) +
+            Math.pow(
+                farY - pcY,
+                2
+            )
+        ) /
+        ppft;
+
+
+    /*
+     * ----------------------------------------------------
+     * VISION RANGE
+     *
+     * Every source gets:
+     *
+     *     120 ft - PC-to-source distance
+     *
+     * This is the same principle used by the older
+     * working version.
+     * ----------------------------------------------------
+     */
+
+   function sourceRange(distance) {
+    if (distance >= MAX_SIGHT) {
+        return 0;
+    }
+
+    return Math.max(
+        0,
+        MAX_SIGHT - distance + 6
+    );
+}
+
+
+    const nearRange =
+        sourceRange(
+            nearDistance
+        );
+
+
+    const leftRange =
+        sourceRange(
+            leftDistance
+        );
+
+
+    const rightRange =
+        sourceRange(
+            rightDistance
+        );
+
+
+    const farRange =
+    Math.max(
+        0,
+        MAX_SIGHT - farDistance + 6
+    );
+
+
+    /*
+     * ----------------------------------------------------
+     * INSIDE SOURCES
+     *
+     * These are placed just inside the Darkness boundary.
+     * Each source's range is based on its distance from this
+     * particular viewer, keeping its maximum reach within
+     * the viewer's 120 ft sight allowance.
+     * ----------------------------------------------------
+     */
+
+    const insideDistance =
+        Math.max(
+            0,
+            radiusPixels - EDGE_OFFSET_PIXELS
+        );
+
+    const insideTopX = darkX;
+    const insideTopY = darkY - insideDistance;
+
+    const insideRightX = darkX + insideDistance;
+    const insideRightY = darkY;
+
+    const insideBottomX = darkX;
+    const insideBottomY = darkY + insideDistance;
+
+    const insideLeftX = darkX - insideDistance;
+    const insideLeftY = darkY;
+	
+	/* Inside source aligned with the outside Far source. */
+const insideFarX =
+    darkX + ux * insideDistance;
+
+const insideFarY =
+    darkY + uy * insideDistance;
+
+    function distanceToInsideSource(x, y) {
+        return Math.sqrt(
+            Math.pow(x - pcX, 2) +
+            Math.pow(y - pcY, 2)
+        ) / ppft;
+    }
+
+    const insideTopRange =
+        sourceRange(
+            distanceToInsideSource(insideTopX, insideTopY)
+        );
+
+    const insideRightRange =
+        sourceRange(
+            distanceToInsideSource(insideRightX, insideRightY)
+        );
+
+    const insideBottomRange =
+        sourceRange(
+            distanceToInsideSource(insideBottomX, insideBottomY)
+        );
+
+    const insideLeftRange =
+        sourceRange(
+            distanceToInsideSource(insideLeftX, insideLeftY)
+        );
+
+const insideFarRange =
+    sourceRange(
+        distanceToInsideSource(insideFarX, insideFarY)
+    );
+
+       /*
+     * ----------------------------------------------------
+     * CREATE THE FOUR OUTSIDE TOKENS
+     * ----------------------------------------------------
+     */
+
+    const nearToken =
+        createVisionToken(
+            data,
+            pcToken,
+            "Near",
+            nearX,
+            nearY,
+            centreAngle,
+            nearRange
+        );
+
+
+    const leftToken =
+        createVisionToken(
+            data,
+            pcToken,
+            "Left",
+            leftX,
+            leftY,
+            angleLeft,
+            leftRange
+        );
+
+
+    const rightToken =
+        createVisionToken(
+            data,
+            pcToken,
+            "Right",
+            rightX,
+            rightY,
+            angleRight,
+            rightRange
+        );
+
+
+    const farToken =
+        createVisionToken(
+            data,
+            pcToken,
+            "Far",
+            farX,
+            farY,
+            centreAngle,
+            farRange
+        );
+
+
+    /*  individual sources just inside the boundary. */
+    const insideTopToken =
+        createVisionToken(
+            data, pcToken, "InsideTop",
+            insideTopX, insideTopY,
+            centreAngle, insideTopRange
+        );
+
+    const insideRightToken =
+        createVisionToken(
+            data, pcToken, "InsideRight",
+            insideRightX, insideRightY,
+            centreAngle, insideRightRange
+        );
+
+    const insideBottomToken =
+        createVisionToken(
+            data, pcToken, "InsideBottom",
+            insideBottomX, insideBottomY,
+            centreAngle, insideBottomRange
+        );
+
+    const insideLeftToken =
+        createVisionToken(
+            data, pcToken, "InsideLeft",
+            insideLeftX, insideLeftY,
+            centreAngle, insideLeftRange
+        );
+
+const insideFarToken =
+    createVisionToken(
+        data,
+        pcToken,
+        "InsideFar",
+        insideFarX,
+        insideFarY,
+        centreAngle,
+        insideFarRange
+    );
+
+    data.personalTokens[
+        pcToken.id
+    ] = {
+
+        pcID:
+            pcToken.id,
+
+        near:
+            nearToken ?
+            nearToken.id :
+            null,
+
+        left:
+            leftToken ?
+            leftToken.id :
+            null,
+
+        right:
+            rightToken ?
+            rightToken.id :
+            null,
+
+        far:
+            farToken ?
+            farToken.id :
+            null,
+
+        insideTop:
+            insideTopToken ?
+            insideTopToken.id :
+            null,
+
+        insideRight:
+            insideRightToken ?
+            insideRightToken.id :
+            null,
+
+        insideBottom:
+            insideBottomToken ?
+            insideBottomToken.id :
+            null,
+
+        insideLeft:
+            insideLeftToken ?
+            insideLeftToken.id :
+            null,
+			
+insideFar:
+    insideFarToken ?
+    insideFarToken.id :
+    null
+    };
+}
+    // ========================================================
+    // REBUILD PERSONAL VISION
+    // ========================================================
+
+    function rebuildPersonalVision(
+        data
+    ) {
+
+        removePersonalTokens(
+            data.tokenID
+        );
+
+        data.personalTokens = {};
+
+        const darkness =
+            getObj(
+                "graphic",
+                data.tokenID
+            );
+
+        if (!darkness) {
+            return;
+        }
+
+        /* Devil's Sight / Truesight characters. */
+        getQualifyingTokens(
+            data.pageID
+        ).forEach(
+            function (pcToken) {
+
+                const distance =
+                    distanceInFeet(
+                        pcToken,
+                        darkness
+                    );
+
+                if (
+                    distance <=
+                    MAX_SIGHT + data.radius
+                ) {
+                    createPersonalTokens(
+                        data,
+                        pcToken
+                    );
+                }
+            }
+        );
+
+        /*
+         * EyesOn caster is explicitly added. This does NOT depend
+         * on the caster having Devil's Sight / Truesight.
+         */
+        if (
+            data.eyesOn &&
+            data.casterTokenID
+        ) {
+
+            const casterToken =
+                getObj(
+                    "graphic",
+                    data.casterTokenID
+                );
+
+            if (
+                casterToken &&
+                casterToken.get("_pageid") === data.pageID
+            ) {
+
+                const distance =
+                    distanceInFeet(
+                        casterToken,
+                        darkness
+                    );
+
+                if (
+                    distance <=
+                    MAX_SIGHT + data.radius
+                ) {
+
+                    if (
+                        !data.personalTokens[
+                            casterToken.id
+                        ]
+                    ) {
+                        createPersonalTokens(
+                            data,
+                            casterToken
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+
+    // ========================================================
+    // UPDATE ORDINARY TOKEN BRIGHT VISION
+    // ========================================================
+
+    function updateBrightVision(
+        token,
+        darkness
+    ) {
+
+        if (
+            !token ||
+            !darkness
+        ) {
+            return;
+        }
+
+        if (
+            !shouldManageBrightVision(token)
+        ) {
+            return;
+        }
+
+
+        const data =
+            spells[
+                darkness.id
+            ];
+
+
+        if (!data) {
+            return;
+        }
+
+
+        const key =
+            darkness.id +
+            ":" +
+            token.id;
+
+
+        const distance =
+            distanceInFeet(
+                token,
+                darkness
+            );
+
+
+        const inside =
+            distance <=
+            data.radius;
+
+        /*
+         * Pink-marker tokens are exceptions: preserve their original
+         * bright-light vision while inside Darkness.
+         */
+        if (inside && hasLightExceptionMarker(token)) {
+            if (brightVisionState[key]) {
+                token.set(
+                    "has_bright_light_vision",
+                    brightVisionState[key].originalBrightVision
+                );
+                delete brightVisionState[key];
+            }
+            return;
+        }
+
+        // ----------------------------------------------------
+        // Inside Darkness
+        // ----------------------------------------------------
+
+        if (inside) {
+
+            /*
+             * Devil's Sight / Truesight are unaffected.
+             */
+            if (
+                hasDarknessVisionAbility(
+                    token
+                )
+            ) {
+
+                /*
+                 * If it was previously suppressed,
+                 * restore its original setting.
+                 */
+                if (
+                    brightVisionState[key] &&
+                    brightVisionState[key]
+                        .originalBrightVision === true
+                ) {
+
+                    token.set(
+                        "has_bright_light_vision",
+                        true
+                    );
+                }
+
+                return;
+            }
+
+
+            /*
+             * Save the original setting once.
+             */
+            if (
+                !brightVisionState[key]
+            ) {
+
+                brightVisionState[key] = {
+
+                    originalBrightVision:
+                        token.get(
+                            "has_bright_light_vision"
+                        )
+                };
+            }
+
+
+            /*
+             * Turn OFF only ordinary bright-light vision.
+             *
+             * We do NOT touch:
+             *
+             * has_night_vision
+             * night_vision_distance
+             * night_vision_tint
+             * night_vision_effect
+             */
+            if (
+                brightVisionState[key]
+                    .originalBrightVision === true
+            ) {
+
+                token.set(
+                    "has_bright_light_vision",
+                    false
+                );
+            }
+
+
+            return;
+        }
+
+
+        // ----------------------------------------------------
+        // Outside Darkness
+        // ----------------------------------------------------
+
+        if (
+            brightVisionState[key]
+        ) {
+
+            token.set(
+                "has_bright_light_vision",
+                brightVisionState[key]
+                    .originalBrightVision
+            );
+
+
+            delete brightVisionState[key];
+        }
+    }
+
+
+    // ========================================================
+    // UPDATE ALL ORDINARY TOKENS AGAINST DARKNESS
+    // ========================================================
+
+    function updateBrightVisionForDarkness(
+        data
+    ) {
+
+        const darkness =
+            getObj(
+                "graphic",
+                data.tokenID
+            );
+
+
+        if (!darkness) {
+            return;
+        }
+
+
+        getPageTokens(
+            data.pageID
+        ).forEach(
+            function (token) {
+
+                if (
+                    token.id ===
+                    darkness.id
+                ) {
+                    return;
+                }
+
+
+                updateBrightVision(
+                    token,
+                    darkness
+                );
+            }
+        );
+    }
+
+
+    // ========================================================
+    // UPDATE ORDINARY TOKEN AGAINST ALL DARKNESS
+    // ========================================================
+
+    function updateBrightVisionForToken(
+        token
+    ) {
+
+        if (!token) {
+            return;
+        }
+
+
+        Object.keys(
+            spells
+        ).forEach(
+            function (darknessID) {
+
+                const data =
+                    spells[
+                        darknessID
+                    ];
+
+
+                if (!data) {
+                    return;
+                }
+
+
+                if (
+                    data.pageID !==
+                    token.get("_pageid")
+                ) {
+                    return;
+                }
+
+
+                const darkness =
+                    getObj(
+                        "graphic",
+                        darknessID
+                    );
+
+
+                if (!darkness) {
+                    return;
+                }
+
+
+                updateBrightVision(
+                    token,
+                    darkness
+                );
+            }
+        );
+    }
+
+
+    // ========================================================
+    // UPDATE DARKNESS
+    // ========================================================
+
+    function updateDarkness(
+        data
+    ) {
+
+        const darkness =
+            getObj(
+                "graphic",
+                data.tokenID
+            );
+
+
+        if (!darkness) {
+            return;
+        }
+
+        /*
+         * Recreate UDL boundary.
+         */
+        createDarknessPath(
+            data
+        );
+
+
+        /*
+         * Rebuild personal vision sources inside and outside Darkness.
+         */
+        rebuildPersonalVision(
+            data
+        );
+
+        /*
+         * Ordinary token bright-light vision.
+         */
+        updateBrightVisionForDarkness(
+            data
+        );
+
+        getPageTokens(data.pageID).forEach(function (token) {
+            updateLightSuppression(token);
+        });
+    }
+
+
+    // ========================================================
+    // REGISTER DARKNESS
+    // ========================================================
+
+    function registerDarkness(
+        tokenID,
+        radius,
+        shape,
+        spellName,
+        eyesOn,
+        casterTokenID
+    ) {
+
+        const darkness =
+            getObj(
+                "graphic",
+                tokenID
+            );
+
+
+        if (!darkness) {
+            return;
+        }
+
+
+        const pageID =
+            darkness.get(
+                "_pageid"
+            );
+
+        /*
+         * Move the placed Darkness token to the Foreground layer.
+         * This keeps it out of the normal Objects & Tokens layer
+         * where it could otherwise be accidentally selected or deleted.
+         */
+        darkness.set(
+            "layer",
+            "foreground"
+        );
+
+        spells[tokenID] = {
+
+            tokenID:
+                tokenID,
+
+            pageID:
+                pageID,
+
+            radius:
+                parseFloat(radius) ||
+                15,
+
+            shape:
+                shape ||
+                "circle",
+
+            spellName:
+                spellName ||
+                "Darkness",
+
+            eyesOn:
+                String(eyesOn) === "1",
+
+            casterTokenID:
+                casterTokenID || null,
+
+            pathID:
+                null,
+
+            personalTokens:
+                {}
+        };
+
+
+        const data =
+            spells[tokenID];
+
+
+        /*
+         * Remove the obsolete shared invisible internal source.
+         * Individual personal sources now provide vision inside
+         * Darkness, with separate control and range per viewer.
+         */
+        findObjs({
+            _type: "graphic",
+            _pageid: pageID
+        }).forEach(function (token) {
+            const name = token.get("name") || "";
+            if (name === data.spellName + "_Invis_" + tokenID) {
+                token.remove();
+            }
+        });
+
+        updateDarkness(
+            data
+        );
+    }
+
+
+    // ========================================================
+    // DESTROY DARKNESS
+    // ========================================================
+
+    function destroyDarkness(
+        tokenID
+    ) {
+
+        const data =
+            spells[tokenID];
+
+
+        if (!data) {
+            return;
+        }
+
+
+        /*
+         * Remove UDL path.
+         */
+        removePath(
+            data
+        );
+
+
+        /*
+         * Remove personal vision tokens.
+         */
+        removePersonalTokens(
+            tokenID
+        );
+
+
+/*
+         * Restore ordinary token vision.
+         */
+        const prefix =
+            tokenID + ":";
+
+
+        Object.keys(
+            brightVisionState
+        ).forEach(
+            function (key) {
+
+                if (
+                    key.indexOf(
+                        prefix
+                    ) !== 0
+                ) {
+                    return;
+                }
+
+
+                const tokenIDPart =
+                    key.substring(
+                        prefix.length
+                    );
+
+
+                const token =
+                    getObj(
+                        "graphic",
+                        tokenIDPart
+                    );
+
+
+                if (
+                    token &&
+                    brightVisionState[key]
+                ) {
+
+                    token.set(
+                        "has_bright_light_vision",
+                        brightVisionState[key]
+                            .originalBrightVision
+                    );
+                }
+
+
+                delete brightVisionState[key];
+            }
+        );
+
+
+        delete spells[tokenID];
+
+        /*
+         * Re-evaluate light emission after removing this Darkness,
+         * preserving suppression if another Darkness still contains a token.
+         */
+        getPageTokens(data.pageID).forEach(function (token) {
+            updateLightSuppression(token);
+            updateBrightVisionForToken(token);
+        });
+    }
+
+
+    // ========================================================
+    // DYNAMIC EXCEPTION MARKER
+    // ========================================================
+
+    on("change:graphic:statusmarkers", function (token) {
+        if (!token || isDarknessHelperToken(token)) {
+            return;
+        }
+        updateLightSuppression(token);
+        updateBrightVisionForToken(token);
+    });
+
+
+    // ========================================================
+    // MOVEMENT
+    // ========================================================
+
+    on(
+        "change:graphic:left",
+        function (token) {
+
+            handleGraphicMovement(
+                token
+            );
+        }
+    );
+
+
+    on(
+        "change:graphic:top",
+        function (token) {
+
+            handleGraphicMovement(
+                token
+            );
+        }
+    );
+
+
+    function handleGraphicMovement(
+        token
+    ) {
+
+        if (!token) {
+            return;
+        }
+
+
+        // ----------------------------------------------------
+        // Darkness moved
+        // ----------------------------------------------------
+
+        if (
+            spells[token.id]
+        ) {
+
+            updateDarkness(
+                spells[token.id]
+            );
+
+            return;
+        }
+
+
+        // Light emission applies to linked and unlinked tokens alike.
+        updateLightSuppression(token);
+
+        // ----------------------------------------------------
+        // Character token moved
+        // ----------------------------------------------------
+
+        if (
+            !shouldManageBrightVision(token)
+        ) {
+            return;
+        }
+
+
+        Object.keys(
+            spells
+        ).forEach(
+            function (darknessID) {
+
+                const data =
+                    spells[
+                        darknessID
+                    ];
+
+
+                if (
+                    data.pageID !==
+                    token.get("_pageid")
+                ) {
+                    return;
+                }
+
+
+                const darkness =
+                    getObj(
+                        "graphic",
+                        darknessID
+                    );
+
+
+                if (!darkness) {
+                    return;
+                }
+
+
+                /*
+                 * Ordinary bright-light suppression.
+                 */
+                updateBrightVision(
+                    token,
+                    darkness
+                );
+
+
+                /*
+                 * If this is a qualifying PC, rebuild
+                 * their eight-token vision geometry.
+                 */
+                if (
+                    hasDarknessVisionAbility(
+                        token
+                    ) ||
+                    (
+                        data.eyesOn &&
+                        data.casterTokenID === token.id
+                    )
+                ) {
+
+                    rebuildPersonalVision(
+                        data
+                    );
+                }
+            }
+        );
+    }
+
+
+    // ========================================================
+    // DESTROY GRAPHIC
+    // ========================================================
+
+    on(
+        "destroy:graphic",
+        function (token) {
+
+            if (!token) {
+                return;
+            }
+
+            delete lightSuppressionState[token.id];
+
+            // ------------------------------------------------
+            // Darkness destroyed
+            // ------------------------------------------------
+
+            if (
+                spells[token.id]
+            ) {
+
+                destroyDarkness(
+                    token.id
+                );
+
+                return;
+            }
+
+
+            // ------------------------------------------------
+            // Remove saved ordinary vision state
+            // ------------------------------------------------
+
+            const suffix =
+                ":" +
+                token.id;
+
+
+            Object.keys(
+                brightVisionState
+            ).forEach(
+                function (key) {
+
+                    if (
+                        key.endsWith(
+                            suffix
+                        )
+                    ) {
+
+                        delete brightVisionState[key];
+                    }
+                }
+            );
+
+
+            // ------------------------------------------------
+            // Character token destroyed
+            // ------------------------------------------------
+
+            if (
+                !isCharacterToken(token)
+            ) {
+                return;
+            }
+
+
+            Object.keys(
+                spells
+            ).forEach(
+                function (darknessID) {
+
+                    const data =
+                        spells[
+                            darknessID
+                        ];
+
+
+                    if (
+                        data.pageID !==
+                        token.get("_pageid")
+                    ) {
+                        return;
+                    }
+
+
+                    rebuildPersonalVision(
+                        data
+                    );
+}
+            );
+        }
+    );
+
+
+    // ========================================================
+    // CHAT COMMAND
+    // ========================================================
+
+    on(
+        "chat:message",
+        function (msg) {
+
+            if (
+                msg.type !==
+                "api"
+            ) {
+                return;
+            }
+
+
+            const prefix =
+                "!darknessdl";
+
+
+            if (
+                msg.content.indexOf(
+                    prefix
+                ) !== 0
+            ) {
+                return;
+            }
+
+
+            const args =
+                msg.content
+                    .substring(
+                        prefix.length
+                    )
+                    .trim()
+                    .split(/\s+/);
+
+
+            const tokenID =
+                args[0];
+
+
+            const radius =
+                parseFloat(
+                    args[1]
+                ) || 15;
+
+
+            const shape =
+                args[2] ||
+                "circle";
+
+
+            const eyesOn =
+                args[args.length - 2] ||
+                "0";
+
+            const casterTokenID =
+                args[args.length - 1] ||
+                null;
+
+            const spellName =
+                args
+                    .slice(3, -2)
+                    .join(" ") ||
+                "Darkness";
+
+            if (!tokenID) {
+                return;
+            }
+
+            registerDarkness(
+                tokenID,
+                radius,
+                shape,
+                spellName,
+                eyesOn,
+                casterTokenID
+            );
+        }
+    );
+
+
+    // ========================================================
+    // PUBLIC INTERFACE
+    // ========================================================
+
+    return {
+
+        register:
+            registerDarkness,
+
+        destroy:
+            destroyDarkness,
+
+        update:
+            function (tokenID) {
+
+                if (
+                    spells[tokenID]
+                ) {
+
+                    updateDarkness(
+                        spells[tokenID]
+                    );
+                }
+            }
+    };
+
+})();
