@@ -1,0 +1,80 @@
+!script {{
++++snlib+++
+--#reentrant|Darkness @{selected|character_id}
+--#sourceToken|@{selected|token_id}
+--#emoteBackground|#223030
+--/|#emoteFontColor|#4c0678
+--#titleCardBackground|#4c0678
+--#evenRowBackground|#bbf970
+--#oddRowBackground|#f9dc9e
+--#subtitleFontColor|#000603
+
+--/|variables for summoning
+
+--#title|Darkness
+--&SpellName|Darkness
+--&Radius|15
+--&Shape|circle
+--/| characters with Truesight, Devil's Sight or utilising Eyes of the Dark as a Shadow Magic sorcerer will automatically see through this spell, change this value to 1 if you wish this behaviour for your caster anyway
+--&EyesOn|0
+--&ConcMarker|blue
+
+--/| Insert link to Spell token image below
+--&URLlink|https://files.d20.io/images/502058650/FRgQ1SMai4QxBSU6eRte6g/med.webm?1790270156
+
+--/| check character to see if Shadow Magic Sorcerer
+--?"[*S:class_display]" -inc "Shadow" -and "[*S:class_display]" -inc "Sorcerer" |>CheckCasting
+
+--:SpellSlotCasting|
+--iScriptCards needs additional information to continue;Click to select level of spell slot used|q;Level;Spell Slot|2|3|4|5|6|7|8|9
+--=CastLevel|[&Level]
+--=SlotLevel|[$CastLevel]
+--=SlotsTotal|[*S:lvl[$SlotLevel]_slots_total]
+--=SlotsExpended|[*S:lvl[$SlotLevel]_slots_expended]
+--?[$SlotsExpended.Total] -gt [$SlotsTotal.Total]|>NoSlotsLeft
+--?[$SlotsExpended.Total] -eq 0|>NoSlotsLeft
+-->Lib5E_EXPEND_SPELL_SLOT|[*S:character_id];[$CastLevel]
+
+--/|create main spell token and set a concentration marker
+--:Create|
+--#emoteText|[*S:character_name] casts Darkness
+-->LibSN_ADD_STATUS_MARKER|[*S:t-id];[&ConcMarker]
+
+--!ot:NewTID|name:"[&SpellName]"|_pageid:[*S:t-_pageid]|left:[=[*S:t-left]+210]|top:[*S:t-top]|width:[=[*S:t-width]*7]|height:[=[*S:t-height]*7]|imgsrc:"[&URLlink]"
+--!t:[&NewTID]|controlledby:[&SendingPlayerID]
+--z:graphic:[&NewTID]|toBack
+
+
+--/|create 1 way dynamic lighting line once token is placed
+--+Place [&SpellName] token then click button|[c][rbutton] Spell token placed::Placed[/rbutton][/c]
+--X|
+--:Placed|
+--@darknessdl|[&NewTID] [&Radius] [&Shape] [&SpellName] [&EyesOn] [*S:t-id]
+
+--X|Stop
+
+--:CheckCasting|
+--&FeatureName|Sorcery Points
+--&ResourceName|Sorcery Points
+-->Lib5E_FIND_RESOURCE|[*S:character_id];[&ResourceName];ResName;ResValue
+--/|CHECK HAS POINTS LEFT
+  --?"[$ResValue]" -lt "2"|>NoPoints
+--+Shadow Magic, do you want to spend 2 sorcery points to see or cast normally?|[c][rbutton]Spend 2 points::DeductPoints[/rbutton] [rbutton] Use spell slot instead::SpellSlotCasting[/rbutton][/c]
+--X|
+
+--:DeductPoints|
+  --!a:[*S:character_id]|[&ResValue]:-=2
+ --&EyesOn|1
+ -->Create|
+ 
+--:NoPoints|
+ --+|You do not have enough Sorcery Points for this task, you must cast using a spell slot and forego being able to see in the magical darkness, do you wish to continue [rbutton] Yes::SpellSlotCasting[/rbutton] [rbutton]No::End[/rbutton]
+--X|
+ 
+ --:NoSlotsLeft|
+ --+|[b][*S:character_name] has no level [$CastLevel] spell slots available.[/b]
+ --:End|
+ --X|
+  }}
+  
+  
