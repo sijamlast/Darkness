@@ -1,4 +1,6 @@
 # Darkness
+original base API DL Darkness by David M, modified by @Si
+
 API and ScriptCards script for Roll20, allows tokens with Devil's Sight, Truesight and Shadow Magic Sorcerers to see through the darkness spell to vision limit, but those that would be blinded based on the spell description will have vision removed.
 
 This requires Kurt's ScriptCards available from 1-click and the creation of a handout in the game entitled ScriptCards Library snlib  DO NOT vary this in any way.  Once created, go to Kurt's Github https://github.com/kjaegers/ScriptCards/tree/main/ScriptCards_Examples/libraries and paste the latest version of that library into the handout and save.
